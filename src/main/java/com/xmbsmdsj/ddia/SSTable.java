@@ -3,7 +3,10 @@ package com.xmbsmdsj.ddia;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.locks.Lock;
 import java.io.File;
 import java.io.RandomAccessFile;
 import java.io.IOException;
@@ -11,8 +14,11 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.stream.Stream;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.nio.file.Files;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.Iterator;
 
 public class SSTable {
 
@@ -36,6 +42,7 @@ public class SSTable {
      * seg file is named as seg-<idx>.sst
      */
     private Path dataPath;
+    private final Lock diskLock = new ReentrantLock();
 
     public SSTable(Path dataPath) throws IOException {
         this.dataPath = dataPath;
@@ -68,7 +75,7 @@ public class SSTable {
         return this.segments.size() + 1;
     }
 
-    public void put(String key, String value) throws IOException {
+    synchronized public void put(String key, String value) throws IOException {
         this.head.put(key, value);
         if (this.head.size() >= this.segmentSizeLimit) {
             var onDiskSegment = this.head.dump(this.dataPath.resolve(String.format("seg-%d.sst", nextSegIdx())));
@@ -77,7 +84,7 @@ public class SSTable {
         }
     }
 
-    public String get(String key) throws IOException {
+    synchronized public String get(String key) throws IOException {
         var inMemValue = this.head.get(key);
         if (inMemValue != null) {
             return inMemValue;
@@ -112,6 +119,8 @@ public class SSTable {
      * | keysize: int32 | valuesize: int32 | key | value |
      * | keysize: int32 | valuesize: int32 | key | value |
      * ...
+     * 
+     * keys are sorted with each on-disk segment
      */
     static abstract class Segment {
         abstract String get(String key) throws IOException;
@@ -202,6 +211,59 @@ public class SSTable {
         private long dataSize;
         private long dataSectionOffset;
 
+        static class OnDiskSegmentIterator implements Iterator<OnDiskSegment.Pair> {
+            long offset;
+            OnDiskSegment segment;
+            RandomAccessFile raf;
+    
+            OnDiskSegmentIterator(OnDiskSegment segment) throws IOException {
+                this.segment = segment;
+                this.raf = new RandomAccessFile(segment.path.toFile(), "r");
+                this.offset = segment.dataEntryOffset();
+                this.raf.seek(this.offset);
+            }
+    
+            @Override
+            public boolean hasNext() {
+                return this.segment.dataSize > this.offset;
+            }
+    
+            @Override
+            public OnDiskSegment.Pair next() {
+                try {
+                    var ret = this.segment.nextRecord(this.raf);
+                    this.offset += ret.offset();
+                    return ret;
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        }
+
+        static class Pair {
+            String key;
+            String value;
+            long offset;
+
+            Pair(String key, String value) {
+                this.key = key;
+                this.value = value;
+                this.offset = SIZE_LEN * 2 + strLen(key) + strLen(value);
+            }
+
+            String key() {
+                return this.key;
+            }
+
+            String value() {
+                return this.value;
+            }
+
+            long offset() {
+                return this.offset;
+            }
+        }
+        
         static OnDiskSegment fromPath(Path path) throws IOException {
             var ret = new OnDiskSegment();
             ret.path = path;
@@ -227,7 +289,6 @@ public class SSTable {
             return ret;
         }
 
-        
 
         void debug() throws IOException {
             try (var raf = new RandomAccessFile(path.toFile(), "r")) {
@@ -251,7 +312,7 @@ public class SSTable {
                 if (dataSize > 0 && dataSize < 1000) { // Only try to read if dataSize looks reasonable
                     for (int i = 0; i < dataSize && raf.getFilePointer() < this.dataSize; i++) {
                         var record = nextRecord(raf);
-                        System.out.println("key: " + record.getKey() + " value: " + record.getValue());
+                        System.out.println("key: " + record.key() + " value: " + record.value());
                     }
                 }
             }
@@ -263,11 +324,11 @@ public class SSTable {
                 // Read until we've passed toOffset (which means we've read the record at toOffset)
                 while (raf.getFilePointer() <= toOffset && raf.getFilePointer() < this.dataSize) {
                     var record = nextRecord(raf);
-                    if (record.getKey().compareTo(key) == 0) {
-                        return record.getValue();
+                    if (record.key().compareTo(key) == 0) {
+                        return record.value();
                     }
                     // If we've passed the key (since data is sorted), we can stop
-                    if (record.getKey().compareTo(key) > 0) {
+                    if (record.key().compareTo(key) > 0) {
                         return null;
                     }
                 }
@@ -275,26 +336,30 @@ public class SSTable {
             }
         }
 
-        private Pair<String, String> nextRecord(RandomAccessFile raf) throws IOException {
+        private Pair nextRecord(RandomAccessFile raf) throws IOException {
             var keySize = raf.readInt();
             var valueSize = raf.readInt();
             byte[] key = new byte[(int) keySize];
             raf.readFully(key);
             byte[] value = new byte[(int) valueSize];
             raf.readFully(value);
-            return new Pair<>(new String(key), new String(value));
+            return new Pair(new String(key), new String(value));
         }
 
         private String directLookUp(long offset) throws IOException {
             try (var raf = new RandomAccessFile(path.toFile(), "r")) {
                 raf.seek(offset);
                 var record = nextRecord(raf);
-                return record.getValue();
+                return record.value();
             }
         }
 
         private long indexOffset() {
             return this.dataSectionOffset;
+        }
+
+        private long dataEntryOffset() {
+            return indexOffset() + SIZE_LEN;
         }
 
         @Override
@@ -320,6 +385,40 @@ public class SSTable {
             }
             return lookUpOnDisk(key, fromOffset, toOffset);
         }
+
+        OnDiskSegmentIterator iterator() throws IOException {
+            return new OnDiskSegmentIterator(this);
+        }
+    }
+
+    
+
+    /**
+     * merge on disk segments
+     */
+    synchronized void merge() throws IOException {
+        var iterators = new ArrayList<OnDiskSegment.OnDiskSegmentIterator>();
+        for (var seg : this.segments.reversed()) {
+            iterators.add(seg.iterator());
+        }
+        Set<String> closeSet = new HashSet<>();
+        var newSeg = new InMemorySegment();
+        for (var iter : iterators) {
+            while (iter.hasNext()) {
+                var pair = iter.next();
+                if (closeSet.contains(pair.key())) {
+                    continue;
+                }
+                newSeg.put(pair.key(), pair.value());
+            }
+        }
+        var newDiskSeg = newSeg.dump(dataPath.resolve("tmp.sst"));
+        for (var seg : segments) {
+            Files.delete(seg.path);
+        }
+        Files.move(newDiskSeg.path, dataPath.resolve("seg-1.sst"));
+        this.segments.clear();
+        this.segments.add(OnDiskSegment.fromPath(dataPath.resolve("seg-1.sst")));
     }
     
 }

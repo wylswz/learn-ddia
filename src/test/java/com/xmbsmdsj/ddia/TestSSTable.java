@@ -50,6 +50,12 @@ public class TestSSTable {
         for (var entry : expected.entrySet()) {
             sstable.put(entry.getKey(), entry.getValue());
         }
+
+        for (var entry : expected.entrySet()) {
+            assertEquals(entry.getValue(), sstable.get(entry.getKey()),
+                    "Failed for key: " + entry.getKey());
+        }
+        sstable.merge();
         for (var entry : expected.entrySet()) {
             assertEquals(entry.getValue(), sstable.get(entry.getKey()),
                     "Failed for key: " + entry.getKey());
