@@ -354,10 +354,16 @@ public class SSTable {
             }
         }
 
+        /**
+         * @return offset of end of index section (beginning of data section)
+         */
         private long indexOffset() {
             return this.dataSectionOffset;
         }
 
+        /**
+         * @return offset of beginning of first data entry
+         */
         private long dataEntryOffset() {
             return indexOffset() + SIZE_LEN;
         }
